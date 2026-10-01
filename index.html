@@ -154,7 +154,7 @@ details[open] summary{margin-bottom:10px}
 
   <section class="step" id="s3">
     <div class="step-h"><span class="num">ขั้น 3</span><h2>รวมข้อมูลและบันทึกไฟล์ใหม่</h2>
-      <span class="hint">เรียงตามวันเวลา ต่อท้ายรายการเดิมของแต่ละชีต และตรวจยอดคงเหลือว่าต่อเนื่องจากรายการสุดท้ายหรือไม่</span></div>
+      <span class="hint">เรียงทุกรายการในชีตตามวันที่ (ไฟล์ย้อนหลังจะแทรกเข้าที่ของวันนั้น ช่องที่กรอกไว้ย้ายไปพร้อมแถว) และตรวจยอดคงเหลือว่าต่อเนื่องหรือไม่</span></div>
     <div class="row">
       <button type="button" class="primary" id="runBtn" disabled>รวมข้อมูล</button>
       <span class="muted small" id="runHint">เลือกไฟล์ Summary และไฟล์ Statement ก่อน</span>
@@ -542,7 +542,7 @@ window.libsReady = (function () {
       sheet.dataEnd = sheet.tableEnd - sheet.totals;
       // existing data rows (column A has a value)
       const spec = keySpec(sheet);
-      sheet.keys = new Set(); let lastA = hr, lastVals = null, count = 0;
+      sheet.keys = new Set(); sheet.bals = new Set(); let lastA = hr, lastVals = null, count = 0;
       for (const row of rows) {
         if (row.r <= hr || row.r > sheet.dataEnd) continue;
         const vals = []; row.cells.forEach(c => { if (c.col < sheet.srcCount) vals[c.col] = cellValue(c, sst); });
@@ -550,6 +550,7 @@ window.libsReady = (function () {
         count++; lastA = Math.max(lastA, row.r);
         if (row.r === lastA) lastVals = vals;
         sheet.keys.add(makeKey(spec, vals));
+        const bv = num(vals[spec.bal]); if (bv != null) sheet.bals.add(bv.toFixed(2));
       }
       sheet.lastA = lastA; sheet.count = count;
       sheet.lastBal = lastVals ? num(lastVals[spec.bal]) : null;
@@ -557,7 +558,7 @@ window.libsReady = (function () {
       sheet.lastTime = lastVals && (sheet.profile === 'KBANK' || sheet.profile === 'SCB') ? lastVals[1] : null;
       sheets.push(sheet);
     }
-    zip.__sst = { base: sst.length, list: [], map: new Map(), has: !!sstF };
+    zip.__sst = { base: sst.length, list: [], map: new Map(), has: !!sstF, arr: sst };
     return { zip, sheets, sst };
   }
 
@@ -618,9 +619,10 @@ window.libsReady = (function () {
       changed = false;
       for (const src of pending()) {
         const hits = sheets.filter(sh => {
-          if (sh.profile !== src.bank || lastBalOf[sh.name] == null) return false;
+          if (sh.profile !== src.bank || (lastBalOf[sh.name] == null && !(sh.bals && sh.bals.size))) return false;
           const spec = keySpec(sh); const v = rawVals(recordCells(sh, src.records[0]));
-          return Math.abs(num(v[spec.bal]) - spec.delta(v) - lastBalOf[sh.name]) < 0.005;
+          const prev = num(v[spec.bal]) - spec.delta(v);
+          return Math.abs(prev - lastBalOf[sh.name]) < 0.005 || (sh.bals && sh.bals.has(prev.toFixed(2)));
         });
         if (hits.length === 1) {
           const sh = hits[0]; src.target = sh.name; src.reason = 'ยอดคงเหลือต่อเนื่อง';
@@ -677,20 +679,20 @@ window.libsReady = (function () {
       }
       const rep = { sheet: sheet.name, bank: sheet.profile, account: sheet.account, added: add.length, dup, before: sheet.count, files: srcs.map(s => s.name) };
       if (add.length) {
-        // balance continuity check
-        const v0 = rawVals(add[0].cells);
-        const prev = num(v0[spec.bal]) - spec.delta(v0);
-        rep.continuity = sheet.lastBal == null ? 'first' : (Math.abs(prev - sheet.lastBal) < 0.005 ? 'ok' : 'gap');
-        rep.expectedPrev = prev; rep.lastBal = sheet.lastBal;
+        rep.from = add[0].sort; rep.to = add[add.length - 1].sort; rep.lastBal = sheet.lastBal;
+        const res = await writeRows(zip, sheet, add.map(a => a.cells));
+        // balance check in final date order: each new row must continue from the row above it
         let broken = 0;
-        for (let i = 1; i < add.length; i++) {
-          const a = rawVals(add[i - 1].cells), b = rawVals(add[i].cells);
-          if (Math.abs(num(b[spec.bal]) - spec.delta(b) - num(a[spec.bal])) >= 0.005) broken++;
-        }
-        rep.internalBreaks = broken;
-        rep.newLastBal = num(rawVals(add[add.length - 1].cells)[spec.bal]);
-        rep.from = add[0].sort; rep.to = add[add.length - 1].sort;
-        await writeRows(zip, sheet, add.map(a => a.cells));
+        res.sorted.forEach((it, i) => {
+          if (!it.isNew || i === 0) return;
+          const a = res.sorted[i - 1].vals, b = it.vals;
+          const pa = num(a[spec.bal]), pb = num(b[spec.bal]);
+          if (pa == null || pb == null) return;
+          if (Math.abs(pb - spec.delta(b) - pa) >= 0.005) broken++;
+        });
+        rep.breaks = broken; rep.inserted = res.inserted;
+        rep.continuity = sheet.count === 0 ? 'first' : (broken ? 'gap' : 'ok');
+        rep.newLastBal = num(res.sorted[res.sorted.length - 1].vals[spec.bal]);
         anyChange = true;
       }
       report.push(rep);
@@ -740,6 +742,42 @@ window.libsReady = (function () {
         }
       }
     }
+    // ---- keep the sheet in date order: whole rows move (Doc., หมายเหตุ and every other column go with their row) ----
+    const S = zip.__sst || { arr: [], list: [], base: 0 };
+    const valOf = (cell) => {
+      if (!cell) return null;
+      const t = attr(cell.attrs, 't');
+      if (t === 's') { const v = cell.inner.match(/<v>(\d+)<\/v>/); if (!v) return null; const i = +v[1]; return i < S.base ? S.arr[i] : S.list[i - S.base]; }
+      return cellValue(cell, S.arr);
+    };
+    const newSet = new Set(); for (let i = 0; i < newRows.length; i++) newSet.add(start + i);
+    const items = rows.filter(r => r.r > sheet.headerRow && r.r <= needEnd).map(r => {
+      const vals = []; r.cells.forEach(c => { if (c.col < sheet.srcCount) vals[c.col] = valOf(c); });
+      return { row: r, vals, isNew: newSet.has(r.r), r0: r.r };
+    }).filter(it => it.vals[0] != null && it.vals[0] !== '');
+    let lastKey = -Infinity;
+    for (const it of items) { const kk = rowSortKey(sheet, it.vals); it.key = kk == null ? lastKey : kk; lastKey = it.key; }
+    const slots = items.map(it => it.r0);
+    const sorted = items.slice().sort((a, b) => (a.key - b.key) || (a.isNew - b.isNew) || (a.r0 - b.r0));
+    const rowMap = new Map();
+    sorted.forEach((it, i) => { if (it.r0 !== slots[i]) rowMap.set(it.r0, slots[i]); it.row.r = slots[i]; });
+    let lastOld = -1; sorted.forEach((it, i) => { if (!it.isNew) lastOld = i; });
+    const inserted = sorted.filter((it, i) => it.isNew && i < lastOld).length;
+    if (rowMap.size) {
+      const mapRef = (ref) => ref.replace(/([A-Z]+)(\d+)/g, (m, c, r) => c + (rowMap.has(+r) ? rowMap.get(+r) : r));
+      xml = xml.replace(/(<hyperlink\b[^>]*\bref=")([^"]+)"/g, (m, a, b) => a + mapRef(b) + '"');
+      const relPath = sheet.path.replace(/([^/]+)$/, '_rels/$1.rels');
+      if (zip.file(relPath)) {
+        const rels = await zip.file(relPath).async('string');
+        for (const m of rels.matchAll(/Target="([^"]*(?:comments|threadedComment|vmlDrawing)[^"]*)"/gi)) {
+          const p = resolvePath(sheet.path, m[1]); const f = zip.file(p); if (!f) continue;
+          let x = await f.async('string');
+          if (/vmlDrawing/i.test(p)) x = x.replace(/<x:Row>(\d+)<\/x:Row>/g, (mm, n) => '<x:Row>' + ((rowMap.get(+n + 1) || (+n + 1)) - 1) + '</x:Row>');
+          else x = x.replace(/(<(?:comment|threadedComment)\b[^>]*\bref=")([^"]+)"/g, (mm, a, b) => a + mapRef(b) + '"');
+          zip.file(p, x);
+        }
+      }
+    }
     rows.sort((a, b) => a.r - b.r);
     const newSd = '<sheetData>' + rows.map(serRow).join('') + '</sheetData>';
     xml = xml.replace(/<sheetData>[\s\S]*?<\/sheetData>|<sheetData\/>/, () => newSd);
@@ -769,6 +807,22 @@ window.libsReady = (function () {
     }
     zip.file(sheet.path, xml);
     sheet.lastA = needEnd;
+    return { sorted: sorted.map(it => ({ vals: it.vals, isNew: it.isNew, key: it.key })), inserted };
+  }
+
+  function rowSortKey(sheet, vals) {
+    const a = vals[0]; let k = null;
+    if (typeof a === 'number') k = a;
+    else if (typeof a === 'string') {
+      const m = a.match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+      if (m) k = serial(+m[3], +m[2], +m[1], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+    }
+    if (k != null && (sheet.profile === 'KBANK' || sheet.profile === 'SCB')) {
+      const b = vals[1];
+      if (typeof b === 'number') k = Math.floor(k) + (b % 1);
+      else if (typeof b === 'string' && /\d:\d/.test(b)) k = Math.floor(k) + tfrac(b);
+    }
+    return k;
   }
 
   /* amounts show as 1,234.56 / -1,550.00: give money cells a copy of their style with format #,##0.00 (built-in id 4) */
@@ -1110,9 +1164,9 @@ function renderResult(report) {
   const cont = (r) => {
     if (!r.added) return '<span class="chip mute">ไม่มีรายการใหม่</span>';
     let h = r.continuity === 'ok' ? '<span class="chip ok">ยอดต่อเนื่อง</span>'
-      : r.continuity === 'first' ? '<span class="chip mute">ชีตว่าง เริ่มรายการแรก</span>'
-      : `<span class="chip warn" title="ยอดก่อนรายการแรกของไฟล์ใหม่ ${fmtN(r.expectedPrev)} แต่ยอดสุดท้ายในชีต ${fmtN(r.lastBal)}">ยอดไม่ต่อเนื่อง ต่าง ${fmtN(r.expectedPrev - r.lastBal)}</span>`;
-    if (r.internalBreaks) h += ` <span class="chip warn">ยอดในไฟล์สะดุด ${r.internalBreaks} จุด</span>`;
+      : r.continuity === 'first' ? (r.breaks ? `<span class="chip warn">ยอดไม่ต่อเนื่อง ${r.breaks} จุด</span>` : '<span class="chip mute">ชีตว่าง เริ่มรายการแรก</span>')
+      : `<span class="chip warn" title="ยอดคงเหลือของรายการใหม่ไม่ต่อจากรายการก่อนหน้า อาจขาด Statement บางวัน">ยอดไม่ต่อเนื่อง ${r.breaks} จุด</span>`;
+    if (r.inserted) h += ` <span class="chip mute">แทรกตามวันที่ ${r.inserted} รายการ</span>`;
     return h;
   };
   $('result').innerHTML = `
