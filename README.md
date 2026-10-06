@@ -1,6 +1,6 @@
 # รวม Statement ธนาคารรายวัน
 
-เว็บสำหรับนำไฟล์ Statement ที่ดาวน์โหลดจาก BBL, KBank, KTB และ SCB มาต่อท้ายในไฟล์ Summary BankStatement ตามฟอร์ม
+เว็บสำหรับนำไฟล์ Statement ที่ดาวน์โหลดจาก BBL, KBank, KTB และ SCB มาต่อท้ายในไฟล์ Summary BankStatement ตามฟอร์ม (เลือกบริษัท SCE/SCR/SCO, SCORP/SC หรือ SCA ก่อนเริ่ม)
 
 ## ไฟล์ใน repository
 
